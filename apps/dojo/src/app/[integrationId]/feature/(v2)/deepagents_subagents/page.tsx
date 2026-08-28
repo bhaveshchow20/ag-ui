@@ -7,7 +7,6 @@ import {
   UseAgentUpdate,
   useConfigureSuggestions,
   useInterrupt,
-  useSubagent,
   CopilotChat,
   CopilotChatConfigurationProvider,
   CopilotChatAssistantMessage,
@@ -33,6 +32,103 @@ type AssistantMessageProps = React.ComponentProps<
   typeof CopilotChatAssistantMessage
 >;
 type ChatMessage = NonNullable<AssistantMessageProps["messages"]>[number];
+
+// --- Subagent lifecycle tracking (demo-local) --------------------------------
+// The AG-UI client delivers the subagent lifecycle to any subscriber:
+// AgentSubscriber carries onSubagentStartedEvent / onSubagentFinishedEvent /
+// onSubagentErrorEvent callbacks. The demo tracks them in a React context —
+// started ⇒ running (and carries the friendly name/description), finished ⇒
+// finished (suspended outcomes included: on resume the same subagentRunId is
+// re-announced via a fresh SUBAGENT_STARTED and flips back to running), error ⇒
+// error. A FINISHED with no prior STARTED is dropped; an ERROR with no prior
+// STARTED synthesizes an entry with the id as its display name.
+
+type SubagentStatus = "running" | "finished" | "error";
+
+interface SubagentLifecycle {
+  subagentRunId: string;
+  name: string;
+  description?: string;
+  status: SubagentStatus;
+  /** Set only when `status === "error"` (from SUBAGENT_ERROR.message). */
+  error?: string;
+}
+
+const SubagentLifecycleContext = React.createContext<
+  Record<string, SubagentLifecycle>
+>({});
+
+// Subscribes from PAGE mount, not from the group component: SUBAGENT_STARTED
+// precedes the subagent's first attributed message, and SubagentGroup only
+// mounts once that message exists — a subscription opened there would miss the
+// started event and lose the friendly name. Subscriber callbacks fire only
+// while a run streams (no replay), so entries for prior-turn subagents replayed
+// through MESSAGES_SNAPSHOT stay absent — the groups render those neutrally
+// (see isUnregistered below).
+function SubagentLifecycleProvider({
+  agentId,
+  children,
+}: {
+  agentId: string;
+  children: React.ReactNode;
+}) {
+  const { agent } = useAgent({ agentId, updates: [] });
+  const [subagents, setSubagents] = React.useState<
+    Record<string, SubagentLifecycle>
+  >({});
+
+  React.useEffect(() => {
+    const { unsubscribe } = agent.subscribe({
+      onSubagentStartedEvent: ({ event }) => {
+        setSubagents((prev) => ({
+          ...prev,
+          [event.subagentRunId]: {
+            subagentRunId: event.subagentRunId,
+            name: event.name,
+            description: event.description,
+            status: "running",
+          },
+        }));
+      },
+      onSubagentFinishedEvent: ({ event }) => {
+        setSubagents((prev) => {
+          const existing = prev[event.subagentRunId];
+          if (!existing) {
+            return prev; // FINISHED without a prior STARTED — nothing to update
+          }
+          return {
+            ...prev,
+            [event.subagentRunId]: { ...existing, status: "finished" },
+          };
+        });
+      },
+      onSubagentErrorEvent: ({ event }) => {
+        setSubagents((prev) => {
+          const existing = prev[event.subagentRunId];
+          return {
+            ...prev,
+            [event.subagentRunId]: existing
+              ? { ...existing, status: "error", error: event.message }
+              : {
+                  subagentRunId: event.subagentRunId,
+                  // No prior STARTED seen — the id is the only name we have.
+                  name: event.subagentRunId,
+                  status: "error",
+                  error: event.message,
+                },
+          };
+        });
+      },
+    });
+    return () => unsubscribe();
+  }, [agent]);
+
+  return (
+    <SubagentLifecycleContext.Provider value={subagents}>
+      {children}
+    </SubagentLifecycleContext.Provider>
+  );
+}
 
 // Join truthy class-name parts (tiny local stand-in for clsx/twMerge; we own
 // all the classes here so there are no conflicts to dedupe).
@@ -118,11 +214,11 @@ const subagentGroupOpen: Record<string, boolean> = {};
 // container (below). Collapsed until the user expands it (expansion is
 // remembered per subagentRunId — see subagentGroupOpen). A subtle activity dot
 // shows while THIS subagent is running — its own lifecycle, read from
-// `useSubagent`, which the registry flips to "finished" on the
-// SUBAGENT_FINISHED the integration emits when the subagent's `task` delegation
-// returns (not when the parent run ends). The body gathers every message
-// carrying this subagentRunId from the live agent state, so when several subagents
-// run each gets its own independent header/body.
+// SubagentLifecycleContext, which flips to "finished" on the SUBAGENT_FINISHED
+// the integration emits when the subagent's `task` delegation returns (not
+// when the parent run ends). The body gathers every message carrying this
+// subagentRunId from the live agent state, so when several subagents run each
+// gets its own independent header/body.
 function SubagentGroup({
   subagentRunId,
   agentId,
@@ -130,11 +226,8 @@ function SubagentGroup({
   subagentRunId: string;
   agentId: string;
 }) {
-  // CopilotKit's registry supplies `name`/`description`; it keys subagents by
-  // the same per-invocation id the protocol carries. Both sides use
-  // `subagentRunId` as of CopilotKit PR #5873, so this is plain shorthand — if
-  // it ever needs an explicit mapping again, the two names have diverged.
-  const subagent = useSubagent({ subagentRunId, agentId });
+  const subagent: SubagentLifecycle | undefined =
+    React.useContext(SubagentLifecycleContext)[subagentRunId];
   // Live subscription so the group re-renders as the subagent streams more
   // messages/tool calls. The custom-message host memoizes on the anchor
   // message, so without a store subscription of its own the body would freeze
@@ -159,8 +252,8 @@ function SubagentGroup({
       return true;
     });
   }, [agent.messages, subagentRunId]);
-  // Three registry-backed states (running / finished / error) plus a fourth:
-  // `undefined` means the registry has never heard of this id. That is NOT
+  // Three tracked states (running / finished / error) plus a fourth:
+  // `undefined` means the lifecycle context never heard of this id. That is NOT
   // "running" — the protocol allows attribution with no lifecycle events at
   // all, and prior-turn messages replayed through MESSAGES_SNAPSHOT arrive
   // without their SUBAGENT_STARTED. Render those neutrally (hollow marker,
@@ -413,7 +506,11 @@ export default function DeepagentsSubagents({
       renderCustomMessages={RENDER_CUSTOM_MESSAGES}
     >
       <CopilotChatConfigurationProvider agentId={AGENT_ID}>
-        <SubagentAttributionDemo />
+        {/* Wraps the chat so the custom-message-rendered SubagentGroups (which
+            render inside CopilotChat's tree) can read the lifecycle context. */}
+        <SubagentLifecycleProvider agentId={AGENT_ID}>
+          <SubagentAttributionDemo />
+        </SubagentLifecycleProvider>
       </CopilotChatConfigurationProvider>
     </CopilotKitProvider>
   );
