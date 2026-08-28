@@ -138,9 +138,15 @@ jobs:
         # confined to the runner: the whole point of the lane is to report on a
         # version the repository has not adopted, so it does not also assert
         # that those files are untouched afterwards. Nothing is committed.
+        # block-exotic-subdeps is lifted for this one resolution: `pnpm add`
+        # re-resolves the whole workspace lockfile, and the dojo's TEMPORARY
+        # CopilotKit preview pins (PNI-275) resolve their subdeps via URL,
+        # which the guard refuses on any fresh resolution. The guard protects
+        # the COMMITTED lockfile; this lane's rewrite is throwaway (see above),
+        # so nothing is lost. Remove together with the preview pins.
         run: |
           set -euo pipefail
-          pnpm add -D "@strands-agents/sdk@latest"
+          npm_config_block_exotic_subdeps=false pnpm add -D "@strands-agents/sdk@latest"
           pnpm list @strands-agents/sdk --depth 0
 
       - name: Typecheck against the newest release
