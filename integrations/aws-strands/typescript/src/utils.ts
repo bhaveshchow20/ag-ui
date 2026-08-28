@@ -1387,7 +1387,7 @@ export async function convertAguiContentToStrands(
       continue;
     }
 
-    if (item.type === "binary") {
+    if ((item as { type: string }).type === "binary") {
       // Deprecated legacy binary content — try to map to an image block.
       const bin = item as {
         type: "binary";
