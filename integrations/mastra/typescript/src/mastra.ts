@@ -2916,7 +2916,8 @@ export class MastraAgent extends AbstractAgent {
               messages,
               threadId,
               runId,
-            } as RunAgentInput,
+              tools,
+            } satisfies RunAgentInput,
             existingToolNames,
             config: this.a2ui,
           });
